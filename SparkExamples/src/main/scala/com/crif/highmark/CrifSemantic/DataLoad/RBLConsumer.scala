@@ -1,0 +1,916 @@
+package com.crif.highmark.CrifSemantic.DataLoad
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
+import scala.concurrent.ExecutionContext.Implicits.global
+
+object RBLConsumer extends App{
+val spark = SparkSession.builder().appName("RBLConsumer")
+.config("hive.metastore.uris", "thrift://chmcisprbdmn01.chm.intra:9083")
+.config("hive.exec.dynamic.partition", "true")
+.config("hive.exec.dynamic.partition.mode", "nonstrict")
+.config("hive.enforce.bucketing", "true")
+.config("hive.exec.max.dynamic.partitions", "20000")
+.enableHiveSupport().getOrCreate()
+
+
+val argument = spark.sparkContext.getConf.get("spark.driver.args").split("\\s+")
+val mfi_id=argument(0)
+val end_dt=argument(1)
+
+
+val trendDataDF = spark.sql(s"""
+SELECT 
+  cast(
+    CASE WHEN regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) IS NOT NULL 
+    AND TRIM(A.ASSET_CLASS) IS NULL THEN nvl(
+      cast(
+        regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) as int
+      ), 
+      0
+    ) WHEN regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) IS NULL 
+    AND TRIM(A.ASSET_CLASS) IS NOT NULL THEN CASE WHEN TRIM(A.ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(A.ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(A.ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(A.ASSET_CLASS) IN ('L05') THEN 1 END WHEN regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) IS NOT NULL 
+    AND TRIM(A.ASSET_CLASS) IS NOT NULL THEN CASE WHEN NVL(
+      cast(
+        CASE WHEN TRIM(A.ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(A.ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(A.ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(A.ASSET_CLASS) IN ('L05') THEN 1 END as int
+      ), 
+      0
+    ) <= nvl(
+      cast(
+        regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) as int
+      ), 
+      0
+    ) THEN nvl(
+      cast(
+        regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) as int
+      ), 
+      0
+    ) ELSE NVL(
+      cast(
+        CASE WHEN TRIM(A.ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(A.ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(A.ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(A.ASSET_CLASS) IN ('L05') THEN 1 END as int
+      ), 
+      0
+    ) END WHEN regexp_extract(A.DAYS_PAST_DUE, '[0-9]+', 0) IS NULL 
+    AND TRIM(A.ASSET_CLASS) IS NULL THEN CASE WHEN A.DAS = 'S04' THEN 0 WHEN A.DAS = 'S05' THEN 1 ELSE 0 END END as int
+  ) DERIVED_DPD, 
+  A.DAYS_PAST_DUE, 
+  A.MFI_ID, 
+  LAST_DAY(cast(A.ACT_REPORTED_DT as date)) ACT_REPORTED_DT, 
+  NVL(
+    ABS(A.CURRENT_BALANCE), 
+    0
+  ) CURRENT_BALANCE, 
+  NVL(
+    CAST(
+      ABS(A.AMOUNT_OVERDUE_TOTAL) as double
+    ), 
+    0
+  ) AMOUNT_OVERDUE_TOTAL, 
+  ABS(A.CHARGEOFF_AMT) CHARGEOFF_AMT, 
+  A.DAS DAS, 
+  CLOSED_DT CLOSED_DT, 
+  A.ACCOUNT_KEY, 
+  CASE WHEN CLOSED_DT IS NULL 
+  OR CLOSED_DT > cast(A.ACT_REPORTED_DT as date) THEN 'Y' ELSE 'N' END NOT_CLOSED_IND, 
+  CASE WHEN ABS(
+    COALESCE(
+      B.HIGH_CREDIT, B.DISBURSED_AMOUNT, 
+      B.CREDIT_LIMIT, A.CURRENT_BALANCE
+    )
+  )<= ABS(A.CURRENT_BALANCE) THEN ABS(A.CURRENT_BALANCE) ELSE ABS(
+    COALESCE(
+      B.HIGH_CREDIT, B.DISBURSED_AMOUNT, 
+      B.CREDIT_LIMIT, A.CURRENT_BALANCE
+    )
+  ) END SANCTIONED_AMOUNT, 
+  B.ACCOUNT_TYPE ACCOUNT_TYPE, 
+  LAST_DAY(B.DISBURSED_DT) DISBURSED_DT, 
+  MONTHS_BETWEEN(
+    LAST_DAY(A.ACT_REPORTED_DT), 
+    LAST_DAY(B.DISBURSED_DT)
+  ) MOB, 
+  CASE WHEN A.MFI_ID = 'PRB0000006' THEN 'RBL Bank' ELSE SUBSTR(A.MFI_ID, 1, 3) END CONTRI_TYPE, 
+  CASE WHEN A.MFI_ID LIKE 'PRB0000006' THEN 'RBL BANK' WHEN A.MFI_ID IN (
+    'NBF0000324', 'PRB0000027', 'PRB0000001', 
+    'NBF0000125', 'NBF0001009', 'NBF0000320', 
+    'NBF0000297', 'FRB0000006', 'NBF0000082'
+  ) THEN 'P1 GROUP' ELSE 'OTHERS' END P1_GROUP, 
+  CASE WHEN A.MFI_ID LIKE 'PRB0000006' THEN 'RBL BANK' WHEN A.MFI_ID IN (
+    'PRB0000003', 'PRB0000001', 'PRB0000027', 
+    'PRB0000025', 'FRB0000006', 'PRB0000009', 
+    'NBF0000082', 'NBF0000085', 'HFC0000036', 
+    'NBF0001414', 'NBF0001415', 'NBF0000084', 
+    'PRB0000016', 'PRB0000011'
+  ) THEN 'P2 GROUP' ELSE 'OTHERS' END P2_GROUP 
+FROM 
+  hmanalytics.hm_mfi_account_trend A 
+  JOIN hmanalytics.hm_cns_account_prod_new B 
+ON(
+    A.ACCOUNT_KEY = B.ACCOUNT_KEY 
+    AND B.ACCOUNT_TYPE IN (
+      'A06', 'A12', 'A01', 'A07', 'A04', 'A33', 
+      'A14', 'A22', 'A23', 'A27', 'A31', 
+      'A42'
+    ) 
+    AND B.ACTIVE = 1 
+    AND B.DISBURSED_DT >= From_unixtime(
+      Unix_timestamp('01-APR-13', 'dd-MMM-yy'), 
+      'yyyy-MM-dd'
+    )
+    AND cast(A.REPORTED_DT as date)  >= From_unixtime(
+      Unix_timestamp('01-APR-15', 'dd-MMM-yy'), 
+      'yyyy-MM-dd'
+    )
+    AND cast(A.REPORTED_DT as date) <= From_unixtime(
+      Unix_timestamp('"""+end_dt+ """', 'dd-MMM-yy'), 
+      'yyyy-MM-dd'
+    )
+ AND B.commercial_ind <> 1 
+ )
+""")
+
+trendDataDF.createOrReplaceTempView("tempTrend")
+
+val trendAggr = spark.sql(s"""
+Select 
+  'T' IND,
+ ACCOUNT_TYPE,
+  CASE WHEN ACCOUNT_TYPE = 'A06' THEN 'HL' WHEN ACCOUNT_TYPE = 'A12' THEN 'PL' WHEN ACCOUNT_TYPE = 'A01' THEN 'AL' WHEN ACCOUNT_TYPE = 'A07' THEN 'LAP' WHEN ACCOUNT_TYPE IN ('A04', 'A33') THEN 'CV' WHEN ACCOUNT_TYPE IN (
+    'A14', 'A22', 'A23', 'A27', 'A31', 'A42'
+  ) THEN 'BL' ELSE ACCOUNT_TYPE END PRODUCT_CATEGORY, 
+  CASE WHEN SANCTIONED_AMOUNT <= 250000 THEN '0-2.5L' WHEN SANCTIONED_AMOUNT BETWEEN 250001 
+  AND 1000000 THEN '2.5L-10L' WHEN SANCTIONED_AMOUNT BETWEEN 1000001 
+  AND 1500000 THEN '10L-15L' WHEN SANCTIONED_AMOUNT BETWEEN 1500001 
+  AND 2000000 THEN '15L-20L' WHEN SANCTIONED_AMOUNT BETWEEN 2000001 
+  AND 2500000 THEN '20L-25L' WHEN SANCTIONED_AMOUNT BETWEEN 2500001 
+  AND 4000000 THEN '25L-40L' WHEN SANCTIONED_AMOUNT BETWEEN 4000001 
+  AND 5000000 THEN '40L-50L' WHEN SANCTIONED_AMOUNT BETWEEN 5000001 
+  AND 10000000 THEN '50L-1Cr' WHEN SANCTIONED_AMOUNT BETWEEN 10000001 
+  AND 50000000 THEN '1Cr-5Cr' WHEN SANCTIONED_AMOUNT > 50000000 THEN '>5Cr' ELSE 'NA' END TICKET_SIZE, 
+  DISBURSED_DT, 
+  CASE WHEN CONTRI_TYPE = 'RBL Bank' THEN 'RBL' WHEN CONTRI_TYPE = 'SBI' 
+  OR CONTRI_TYPE = 'NAB' THEN 'PSUs' WHEN CONTRI_TYPE = 'HFC' 
+  OR CONTRI_TYPE = 'NBF' THEN 'NBFCs' WHEN CONTRI_TYPE = 'PRB' THEN 'PVT' ELSE 'Others' END LENDER_TYPE, 
+  P1_GROUP AS LENDER_TYPE1, 
+  P2_GROUP AS LENDER_TYPE2, 
+  MOB,
+  ACT_REPORTED_DT,
+  COUNT(ACCOUNT_KEY) TOTAL_LOANS, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) ACTIVE_LOANS, 
+  SUM(SANCTIONED_AMOUNT) TOTAL_DISB_AMOUNT, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN SANCTIONED_AMOUNT ELSE 0 END
+  ) TOTAL_ACTIV_DISB_AMOUNT, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) TOTAL_ACTIVE_POS, 
+  COUNT(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL > (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_NS, 
+  COUNT(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL <= (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_CURR, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_DPD_0, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 1 
+    AND 30 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_1_30, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 31 
+    AND 60 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_31_60, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 61 
+    AND 90 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_61_90, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 180 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_91_180, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 181 
+    AND 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_181_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_91_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 30 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_30, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 60 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_60, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 90 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_90, 
+  SUM(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL > (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_NS, 
+  SUM(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL <= (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_CURR, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_0, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 1 
+    AND 30 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_1_30, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 31 
+    AND 60 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_31_60, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 61 
+    AND 90 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_61_90, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 180 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_91_180, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 181 
+    AND 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_181_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_91_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 30 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_30, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 60 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_60, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 90 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_90 
+FROM 
+  tempTrend 
+GROUP BY 
+  ACCOUNT_TYPE,
+  CASE WHEN ACCOUNT_TYPE = 'A06' THEN 'HL' WHEN ACCOUNT_TYPE = 'A12' THEN 'PL' WHEN ACCOUNT_TYPE = 'A01' THEN 'AL' WHEN ACCOUNT_TYPE = 'A07' THEN 'LAP' WHEN ACCOUNT_TYPE IN ('A04', 'A33') THEN 'CV' WHEN ACCOUNT_TYPE IN (
+    'A14', 'A22', 'A23', 'A27', 'A31', 'A42'
+  ) THEN 'BL' ELSE ACCOUNT_TYPE END, 
+  CASE WHEN SANCTIONED_AMOUNT <= 250000 THEN '0-2.5L' WHEN SANCTIONED_AMOUNT BETWEEN 250001 
+  AND 1000000 THEN '2.5L-10L' WHEN SANCTIONED_AMOUNT BETWEEN 1000001 
+  AND 1500000 THEN '10L-15L' WHEN SANCTIONED_AMOUNT BETWEEN 1500001 
+  AND 2000000 THEN '15L-20L' WHEN SANCTIONED_AMOUNT BETWEEN 2000001 
+  AND 2500000 THEN '20L-25L' WHEN SANCTIONED_AMOUNT BETWEEN 2500001 
+  AND 4000000 THEN '25L-40L' WHEN SANCTIONED_AMOUNT BETWEEN 4000001 
+  AND 5000000 THEN '40L-50L' WHEN SANCTIONED_AMOUNT BETWEEN 5000001 
+  AND 10000000 THEN '50L-1Cr' WHEN SANCTIONED_AMOUNT BETWEEN 10000001 
+  AND 50000000 THEN '1Cr-5Cr' WHEN SANCTIONED_AMOUNT > 50000000 THEN '>5Cr' ELSE 'NA' END, 
+  DISBURSED_DT, 
+  CASE WHEN CONTRI_TYPE = 'RBL Bank' THEN 'RBL' WHEN CONTRI_TYPE = 'SBI' 
+  OR CONTRI_TYPE = 'NAB' THEN 'PSUs' WHEN CONTRI_TYPE = 'HFC' 
+  OR CONTRI_TYPE = 'NBF' THEN 'NBFCs' WHEN CONTRI_TYPE = 'PRB' THEN 'PVT' ELSE 'Others' END, 
+  MOB,
+  ACT_REPORTED_DT, 
+  P1_GROUP, 
+  P2_GROUP
+""")
+
+
+val prodAggr = spark.sql(s"""
+SELECT 
+  'P' IND, 
+  ACCOUNT_TYPE,
+  CASE WHEN ACCOUNT_TYPE = 'A06' THEN 'HL' WHEN ACCOUNT_TYPE = 'A12' THEN 'PL' WHEN ACCOUNT_TYPE = 'A01' THEN 'AL' WHEN ACCOUNT_TYPE = 'A07' THEN 'LAP' WHEN ACCOUNT_TYPE IN ('A04', 'A33') THEN 'CV' WHEN ACCOUNT_TYPE IN (
+    'A14', 'A22', 'A23', 'A27', 'A31', 'A42'
+  ) THEN 'BL' ELSE ACCOUNT_TYPE END PRODUCT_CATEGORY, 
+  CASE WHEN SANCTIONED_AMOUNT <= 250000 THEN '0-2.5L' WHEN SANCTIONED_AMOUNT BETWEEN 250001 
+  AND 1000000 THEN '2.5L-10L' WHEN SANCTIONED_AMOUNT BETWEEN 1000001 
+  AND 1500000 THEN '10L-15L' WHEN SANCTIONED_AMOUNT BETWEEN 1500001 
+  AND 2000000 THEN '15L-20L' WHEN SANCTIONED_AMOUNT BETWEEN 2000001 
+  AND 2500000 THEN '20L-25L' WHEN SANCTIONED_AMOUNT BETWEEN 2500001 
+  AND 4000000 THEN '25L-40L' WHEN SANCTIONED_AMOUNT BETWEEN 4000001 
+  AND 5000000 THEN '40L-50L' WHEN SANCTIONED_AMOUNT BETWEEN 5000001 
+  AND 10000000 THEN '50L-1Cr' WHEN SANCTIONED_AMOUNT BETWEEN 10000001 
+  AND 50000000 THEN '1Cr-5Cr' WHEN SANCTIONED_AMOUNT > 50000000 THEN '>5Cr' ELSE 'NA' END TICKET_SIZE, 
+  DISBURSED_DT, 
+  CASE WHEN CONTRI_TYPE = 'RBL Bank' THEN 'RBL' WHEN CONTRI_TYPE = 'SBI' 
+  OR CONTRI_TYPE = 'NAB' THEN 'PSUs' WHEN CONTRI_TYPE = 'HFC' 
+  OR CONTRI_TYPE = 'NBF' THEN 'NBFCs' WHEN CONTRI_TYPE = 'PRB' THEN 'PVT' ELSE 'Others' END LENDER_TYPE, 
+  P1_GROUP AS LENDER_TYPE1, 
+  P2_GROUP AS LENDER_TYPE2, 
+  MOB,
+  ACT_REPORTED_DT,
+  COUNT(ACCOUNT_KEY) TOTAL_LOANS, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) ACTIVE_LOANS, 
+  SUM(SANCTIONED_AMOUNT) TOTAL_DISB_AMOUNT, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN SANCTIONED_AMOUNT ELSE 0 END
+  ) TOTAL_ACTIV_DISB_AMOUNT, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) TOTAL_ACTIVE_POS, 
+  COUNT(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL > (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_NS, 
+  COUNT(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL <= (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_CURR, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) THEN ACCOUNT_KEY END
+  ) LOANS_DPD_0, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 1 
+    AND 30 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_1_30, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 31 
+    AND 60 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_31_60, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 61 
+    AND 90 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_61_90, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 180 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_91_180, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 181 
+    AND 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_181_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_91_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 360 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_360, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 30 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_30, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 60 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_60, 
+  COUNT(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 90 THEN ACCOUNT_KEY END
+  ) LOANS_DPD_GTR_90, 
+  SUM(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL > (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_NS, 
+  SUM(
+    CASE WHEN (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) 
+    AND (
+      AMOUNT_OVERDUE_TOTAL <= (
+        0.01 * NVL(SANCTIONED_AMOUNT, 0)
+      )
+    ) 
+    AND (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_CURR, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND (
+      DERIVED_DPD = 0 
+      OR DERIVED_DPD IS NULL
+    ) THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_0, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 1 
+    AND 30 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_1_30, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 31 
+    AND 60 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_31_60, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 61 
+    AND 90 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_61_90, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 180 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_91_180, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 181 
+    AND 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_181_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD BETWEEN 91 
+    AND 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_91_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 360 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_360, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 30 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_30, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 60 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_60, 
+  SUM(
+    CASE WHEN (NOT_CLOSED_IND = 'Y') 
+    AND DAS IN(
+      'S04', 'S05', 'S11', 'S12', 'S16', 'S18', 
+      'S20'
+    ) 
+    AND DERIVED_DPD > 90 THEN CURRENT_BALANCE ELSE 0 END
+  ) POS_DPD_GTR_90 
+FROM 
+  (
+    SELECT 
+      cast(
+        CASE WHEN regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) IS NOT NULL 
+        AND TRIM(ASSET_CLASS) IS NULL THEN nvl(
+          cast(
+            regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) as int
+          ), 
+          0
+        ) WHEN regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) IS NULL 
+        AND TRIM(ASSET_CLASS) IS NOT NULL THEN CASE WHEN TRIM(ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(ASSET_CLASS) IN ('L05') THEN 1 END WHEN regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) IS NOT NULL 
+        AND TRIM(ASSET_CLASS) IS NOT NULL THEN CASE WHEN NVL(
+          cast(
+            CASE WHEN TRIM(ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(ASSET_CLASS) IN ('L05') THEN 1 END as int
+          ), 
+          0
+        ) <= nvl(
+          cast(
+            regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) as int
+          ), 
+          0
+        ) THEN nvl(
+          cast(
+            regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) as int
+          ), 
+          0
+        ) ELSE NVL(
+          cast(
+            CASE WHEN TRIM(ASSET_CLASS) = 'L01' THEN 0 WHEN TRIM(ASSET_CLASS) IN ('L02') THEN 91 WHEN TRIM(ASSET_CLASS) IN ('L03', 'L04') THEN 361 WHEN TRIM(ASSET_CLASS) IN ('L05') THEN 1 END as int
+          ), 
+          0
+        ) END WHEN regexp_extract(DAYS_PAST_DUE, '[0-9]+', 0) IS NULL 
+        AND TRIM(ASSET_CLASS) IS NULL THEN CASE WHEN DAS = 'S04' THEN 0 WHEN DAS = 'S05' THEN 1 ELSE 0 END END as int
+      ) DERIVED_DPD, 
+      DAYS_PAST_DUE, 
+      MFI_ID, 
+      LAST_DAY(ACT_REPORTED_DT) ACT_REPORTED_DT, 
+      NVL(
+        ABS(CURRENT_BALANCE), 
+        0
+      ) CURRENT_BALANCE, 
+      NVL(
+        CAST(
+          ABS(AMOUNT_OVERDUE_TOTAL) as double
+        ), 
+        0
+      ) AMOUNT_OVERDUE_TOTAL, 
+      ABS(CHARGEOFF_AMT) CHARGEOFF_AMT, 
+      DAS, 
+      CLOSED_DT CLOSED_DT, 
+      ACCOUNT_KEY, 
+      CASE WHEN CLOSED_DT IS NULL 
+      OR CLOSED_DT > ACT_REPORTED_DT THEN 'Y' ELSE 'N' END NOT_CLOSED_IND, 
+      CASE WHEN ABS(
+        COALESCE(
+          HIGH_CREDIT, DISBURSED_AMOUNT, CREDIT_LIMIT, 
+          CURRENT_BALANCE
+        )
+      )<= ABS(CURRENT_BALANCE) THEN ABS(CURRENT_BALANCE) ELSE ABS(
+        COALESCE(
+          HIGH_CREDIT, DISBURSED_AMOUNT, CREDIT_LIMIT, 
+          CURRENT_BALANCE
+        )
+      ) END SANCTIONED_AMOUNT, 
+      ACCOUNT_TYPE, 
+      LAST_DAY(DISBURSED_DT) DISBURSED_DT, 
+      MONTHS_BETWEEN(
+        LAST_DAY(ACT_REPORTED_DT), 
+        LAST_DAY(DISBURSED_DT)
+      ) MOB, 
+      CASE WHEN MFI_ID = 'PRB0000006' THEN 'RBL Bank' ELSE SUBSTR(MFI_ID, 1, 3) END CONTRI_TYPE, 
+      CASE WHEN MFI_ID LIKE 'PRB0000006' THEN 'RBL BANK' WHEN MFI_ID IN (
+        'NBF0000324', 'PRB0000027', 'PRB0000001', 
+        'NBF0000125', 'NBF0001009', 'NBF0000320', 
+        'NBF0000297', 'FRB0000006', 'NBF0000082'
+      ) THEN 'P1 GROUP' ELSE 'OTHERS' END P1_GROUP, 
+      CASE WHEN MFI_ID LIKE 'PRB0000006' THEN 'RBL BANK' WHEN MFI_ID IN (
+        'PRB0000003', 'PRB0000001', 'PRB0000027', 
+        'PRB0000025', 'FRB0000006', 'PRB0000009', 
+        'NBF0000082', 'NBF0000085', 'HFC0000036', 
+        'NBF0001414', 'NBF0001415', 'NBF0000084', 
+        'PRB0000016', 'PRB0000011'
+      ) THEN 'P2 GROUP' ELSE 'OTHERS' END P2_GROUP 
+    FROM 
+      hmanalytics.hm_cns_account_prod_new
+ 
+    WHERE 
+      ACCOUNT_TYPE IN (
+        'A06', 'A12', 'A01', 'A07', 'A04', 'A33', 
+        'A14', 'A22', 'A23', 'A27', 'A31', 
+        'A42'
+      ) 
+      AND ACTIVE = 1 
+      AND commercial_ind <> 1
+      AND DISBURSED_DT >= From_unixtime(
+        Unix_timestamp('01-APR-13', 'dd-MMM-yy'), 
+        'yyyy-MM-dd'
+      )
+    AND REPORTED_DT >= From_unixtime(
+      Unix_timestamp('01-APR-15', 'dd-MMM-yy'), 
+      'yyyy-MM-dd'
+    )
+    AND REPORTED_DT <= From_unixtime(
+      Unix_timestamp('"""+end_dt+ """', 'dd-MMM-yy'), 
+      'yyyy-MM-dd'
+    )
+  ) A 
+GROUP BY 
+  ACCOUNT_TYPE,
+  CASE WHEN ACCOUNT_TYPE = 'A06' THEN 'HL' WHEN ACCOUNT_TYPE = 'A12' THEN 'PL' WHEN ACCOUNT_TYPE = 'A01' THEN 'AL' WHEN ACCOUNT_TYPE = 'A07' THEN 'LAP' WHEN ACCOUNT_TYPE IN ('A04', 'A33') THEN 'CV' WHEN ACCOUNT_TYPE IN (
+    'A14', 'A22', 'A23', 'A27', 'A31', 'A42'
+  ) THEN 'BL' ELSE ACCOUNT_TYPE END, 
+  CASE WHEN SANCTIONED_AMOUNT <= 250000 THEN '0-2.5L' WHEN SANCTIONED_AMOUNT BETWEEN 250001 
+  AND 1000000 THEN '2.5L-10L' WHEN SANCTIONED_AMOUNT BETWEEN 1000001 
+  AND 1500000 THEN '10L-15L' WHEN SANCTIONED_AMOUNT BETWEEN 1500001 
+  AND 2000000 THEN '15L-20L' WHEN SANCTIONED_AMOUNT BETWEEN 2000001 
+  AND 2500000 THEN '20L-25L' WHEN SANCTIONED_AMOUNT BETWEEN 2500001 
+  AND 4000000 THEN '25L-40L' WHEN SANCTIONED_AMOUNT BETWEEN 4000001 
+  AND 5000000 THEN '40L-50L' WHEN SANCTIONED_AMOUNT BETWEEN 5000001 
+  AND 10000000 THEN '50L-1Cr' WHEN SANCTIONED_AMOUNT BETWEEN 10000001 
+  AND 50000000 THEN '1Cr-5Cr' WHEN SANCTIONED_AMOUNT > 50000000 THEN '>5Cr' ELSE 'NA' END, 
+  DISBURSED_DT, 
+  CASE WHEN CONTRI_TYPE = 'RBL Bank' THEN 'RBL' WHEN CONTRI_TYPE = 'SBI' 
+  OR CONTRI_TYPE = 'NAB' THEN 'PSUs' WHEN CONTRI_TYPE = 'HFC' 
+  OR CONTRI_TYPE = 'NBF' THEN 'NBFCs' WHEN CONTRI_TYPE = 'PRB' THEN 'PVT' ELSE 'Others' END, 
+  MOB,
+  ACT_REPORTED_DT, 
+  P1_GROUP, 
+  P2_GROUP
+""")
+
+	val f1 = Future{
+	trendAggr.write.mode("overwrite").saveAsTable("hmanalytics.hm_rbl_cns_trend_data")
+	}
+	
+	val f2 = Future{
+  prodAggr.write.mode("overwrite").saveAsTable("hmanalytics.hm_rbl_cns_prd_data")
+	}
+	
+	Await.ready(f1, Duration.Inf)
+	Await.ready(f2, Duration.Inf)
+
+}
